@@ -14,7 +14,7 @@ from fairscale.nn.model_parallel.layers import (
     RowParallelLinear,
 )
 from torch import nn
-
+import pdb
 
 @dataclass
 class ModelArgs:
@@ -430,6 +430,7 @@ class Transformer(nn.Module):
 
         """
         super().__init__()
+        pdb.set_trace()
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
@@ -453,7 +454,7 @@ class Transformer(nn.Module):
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
         """
         Perform a forward pass through the Transformer model.
