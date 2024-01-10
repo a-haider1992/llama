@@ -10,14 +10,18 @@ from fairscale.nn.model_parallel.initialize import (
     initialize_model_parallel
 )
 
+import torch.nn.functional as F
+
 MODEL = "meta-llama/Llama-2-7b-chat-hf"
 MODEL_tiny = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
 # tokenizer = AutoTokenizer.from_pretrained('gpt2')
 
 # tokenizer = AutoTokenizer.from_pretrained(MODEL)
-# if tokenizer.pad_token is None:
-#     tokenizer.add_special_tokens({'pad_token': '[PAD]'}) # add new pad token to tokenizer
+if tokenizer.pad_token is None:
+    tokenizer.add_special_tokens({'pad_token': '[PAD]'}) # add new pad token to tokenizer
+if tokenizer.mask_token is None:
+    tokenizer.add_special_tokens({'mask_token': '[MASK]'}) # add new mask token to tokenizer
 
 def count_parameters(model):
     count = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -26,7 +30,7 @@ def count_parameters(model):
 
 # data = load_dataset("oscar", "unshuffled_deduplicated_en", streaming=True)
 data = load_dataset("bookcorpus",  streaming=True)
-# pdb.set_trace()
+pdb.set_trace()
 
 # torch_data = data.with_format("torch")
 
@@ -65,6 +69,7 @@ def mask_tokens(input_ids, tokenizer, mask_prob=0.15):
 class ConstantLengthDataset(Dataset):
     def __init__(self, data, tokenizer, max_length=512):
         self.data = data
+        self.data_iter = iter(data['train'])
         self.input_ids = []
         self.attention_mask = []
         self.max_length = max_length
@@ -78,21 +83,45 @@ class ConstantLengthDataset(Dataset):
     # def __iter__(self):
     #     return self.tokenizer(next(iter(self.data['train']))['text'], return_tensors="pt", max_length=self.max_length, truncation=True, padding='max_length')
     def __getitem__(self, idx):
-        data = self.tokenizer(next(iter(self.data['train']))['text'], return_tensors="pt", max_length=self.max_length, truncation=True, padding='max_length')
+        # pdb.set_trace()
+        try:
+            # Get the next data instance from the iterator
+            data_instance = next(self.data_iter)
+        except StopIteration:
+            # If the iterator is exhausted, reset it
+            self.data_iter = iter(self.data['train'])
+            data_instance = next(self.data_iter)
+        # print(data_instance['text'])
+        data = self.tokenizer(data_instance['text'], return_tensors="pt", max_length=self.max_length, truncation=True, padding='max_length')
+        # print(data)
+        # return {'tokens': data['input_ids'].squeeze(0), 'start_pos': 0, 'labels': data['input_ids'].squeeze(0)}
         return data
     
-def compute_loss(logits, labels):
+def compute_loss(logits, labels, mask_token_id=-100):
     """
-    Computes cross-entropy loss between logits and labels.
+    Computes cross-entropy loss between logits and labels, ignoring padding tokens.
 
     Args:
         logits (torch.Tensor): Tensor containing logits.
         labels (torch.Tensor): Tensor containing labels.
+        padding_token_id (int): Token ID for padding (default is -100).
 
     Returns:
         torch.Tensor: Scalar tensor containing the loss.
     """
-    return torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
+    # Flatten logits and labels
+    # pdb.set_trace()
+    logits_flat = logits.view(-1, logits.size(-1))
+    labels_flat = labels.view(-1)
+
+    # Create a mask to ignore padding tokens
+    mask = (labels_flat != mask_token_id)
+
+    # Compute the cross-entropy loss, ignoring padding tokens
+    # loss = F.cross_entropy(logits_flat, labels_flat)
+    loss = F.cross_entropy(logits_flat[mask], labels_flat[mask])
+
+    return loss
 
 # write custom torch dataset class using loaded data object from datasets library
 # class BookCorpusDataset(torch.utils.data.IterableDataset):
@@ -128,7 +157,7 @@ def compute_loss(logits, labels):
 # print(f"Total number of tokens present in the raw dataset : {total_tokens}")
 
 total_sequences = 0
-seq_len = 12
+seq_len = 100
 
 # instantiate the constant length dataset
 data_const = ConstantLengthDataset(data=data, tokenizer=tokenizer, max_length=seq_len)
@@ -168,7 +197,8 @@ data_loader = DataLoader(data_const, batch_size=1, shuffle=True)
 # assert isinstance(torch_eval_data, torch.utils.data.Dataset)
 
 # set model arguments
-model_args = llama.ModelArgs(vocab_size=tokenizer.vocab_size, n_layers=4, n_heads=2, max_seq_len=12,)
+# dim controls the dimensionality of the model
+model_args = llama.ModelArgs(vocab_size=tokenizer.vocab_size, n_layers=4, n_heads=4, max_seq_len=seq_len,)
 
 # Parallelize the model
 torch.distributed.init_process_group(backend="nccl")
@@ -177,32 +207,38 @@ torch.cuda.set_device(0)
 
 # build an empty model
 model = llama.Transformer(model_args)
-model_tiny = AutoModelForCausalLM.from_pretrained(MODEL_tiny)
-print(f"Number of parameters in the model: {count_parameters(model_tiny):.1f}M")
-pdb.set_trace()
+# model_tiny = AutoModelForCausalLM.from_pretrained(MODEL_tiny)
+# print(f"Number of parameters in the model: {count_parameters(model_tiny):.1f}M")
+# pdb.set_trace()
 # print(model_tiny)
 
 # count the number of parameters in the model
 print(f"Number of parameters in the model: {count_parameters(model):.1f}M")
 # print(model)
 # pdb.set_trace()
-# optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
 epoch = 0
-while epoch < 5:
-    for item in data_loader:
-        print(item)
-        input_ids = item['input_ids']
+# train the model
+# model = model.to(torch.device('cuda'))
+for epoch in range(5):
+    for index in range(data_const.__len__()):
+        # print(data_const[index])
+        # print(item)
+        input_ids = data_const[index]['input_ids']
 
         # Use mask_tokens function to create masked input and labels
         masked_input_ids, labels = mask_tokens(input_ids, tokenizer)
 
         # Forward pass
-        logits = model(tokens = masked_input_ids.squeeze(0), start_pos = 0)
+        logits = model(tokens = masked_input_ids.clone(), start_pos = 0)
         # print(logits)
 
         # Compute loss
-        loss = compute_loss(logits, labels)
-        print(f"Epoch {epoch} loss: {loss.item()}")
+        loss = compute_loss(logits.clone(), labels.clone(), mask_token_id=tokenizer.mask_token_id)
+        optimizer.zero_grad()  # Clear existing gradients
+        loss.backward(retain_graph=True)
+        optimizer.step()
+        print(f"Data instance {epoch} loss: {loss.item()}")
 
     # batch = next(iter(data_const))
     # original_tokens = batch['input_ids'].squeeze()[-1].item()  # Store the value as it is
@@ -264,8 +300,8 @@ while epoch < 5:
 # # Training script 
 # trainer = Trainer(model = model,
 #         args = training_args,
-#         eval_dataset = Book_data,
-#         train_dataset = Book_data)
+#         eval_dataset = data_const,
+#         train_dataset = data_const)
 
 # trainer.train()
 
