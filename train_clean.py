@@ -3,7 +3,7 @@ from fairscale.nn.model_parallel.initialize import (
     initialize_model_parallel
 )
 from llama.model_modified import Transformer_modified, ModelArgs
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
 from transformers import AutoTokenizer
 import os
 import torch
@@ -55,12 +55,11 @@ class Model:
 
     def train_model(self, data_loader):
         # Perform model training here
-        for index, (tensor_input, text) in enumerate(data_loader):
-            print(f'Index : {index+1}')
-            # print(f'Input : {text}')
+        for (tensor_input, text) in data_loader:
+            print(f'Input : {text}')
             self.optimizer.zero_grad()
             # tensor_input, targets = self.mask_tokens(self.tokenizer("Hello how are you, I m doing great..", return_tensors="pt", max_length=32, truncation=True, padding='max_length')['input_ids'])
-            tensor_input, targets = self.mask_tokens(tensor_input.clone().squeeze(0))
+            tensor_input, targets = self.mask_tokens(tensor_input.squeeze(0))
             # # Forward pass
             # print(f'Input : {tensor_input} has grad : {tensor_input.requires_grad}')
             output = self.model(tokens = tensor_input, start_pos = 0)
@@ -88,14 +87,32 @@ class CustomDataset(Dataset):
         # Get data at the specified index
         self.input_ids = self.tokenizer(self.data['train'][index]['text'], return_tensors="pt", max_length=self.sequence_length, truncation=True, padding='max_length')['input_ids']
         return self.input_ids, self.data['train'][index]['text']
+    
+class CustomIterableDataset(IterableDataset):
+    def __init__(self, data, tokenizer, max_length=512):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.sequence_length = max_length
+        self.index = 0
+
+    def __len__(self):
+        return len(self.data)
+
+    def __iter__(self):
+        instance = self.data['train'][self.index]
+        self.index += 1
+        input_ids = self.tokenizer(instance['text'], return_tensors="pt", max_length=self.sequence_length, truncation=True, padding='max_length')['input_ids']
+        yield input_ids, instance['text']
         
 def main():
     # Load datasets from the datasets library
     tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-    data = load_dataset('rotten_tomatoes')
+    data = load_dataset('bookcorpus')
     sequence_length = 32
     dataset = CustomDataset(data=data, tokenizer=tokenizer, max_length=sequence_length)
+    dataset_iterable = CustomIterableDataset(data=data, tokenizer=tokenizer, max_length=sequence_length)
     data_loader = DataLoader(dataset, batch_size=1, shuffle=True)
+    data_loader_iterable = DataLoader(dataset_iterable, batch_size=1)
 
     # Initialize model parallel
     if not torch.distributed.is_initialized():
