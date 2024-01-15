@@ -56,15 +56,26 @@ class Model:
         count = count / 1000**2
         return count
 
-    def train_model(self, inputs, targets):
+    def train_model(self, data_loader):
         # Perform model training here
-        # pdb.set_trace()
-        self.optimizer.zero_grad()
-        output = self.model(tokens = inputs, start_pos = 0)
-        loss = self.custom_loss_function(output, targets)
-        loss.backward()
-        self.optimizer.step()
-        print(loss.item())
+        for index, (tensor_input, text) in enumerate(data_loader):
+            # print(f'Input : {text}')
+            print(f'Index : {index+1}')
+            self.optimizer.zero_grad()
+            # tensor_input, targets = self.mask_tokens(self.tokenizer("Hello how are you, I m doing great..", return_tensors="pt", max_length=32, truncation=True, padding='max_length')['input_ids'])
+            print(f'Input : {tensor_input}')
+            print(f'Index : {index+1}')
+            tensor_input, targets = self.mask_tokens(tensor_input.squeeze(0))
+            # # Forward pass
+            output = self.model(tokens = tensor_input, start_pos = 0)
+            # # Loss computation
+            loss = self.custom_loss_function(output, targets)
+            print(f'Loss : {loss.item()}')
+            # print(output._version)
+            # ## Backpropagation
+            loss.backward()
+            # # Weight updates
+            self.optimizer.step()
 
 class CustomDataset(Dataset):
     def __init__(self, data, tokenizer, max_length=512):
@@ -85,7 +96,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
     data = load_dataset('rotten_tomatoes')
     sequence_length = 32
-    dataset = CustomDataset(data, tokenizer=tokenizer, max_length=sequence_length)
+    dataset = CustomDataset(data=data, tokenizer=tokenizer, max_length=sequence_length)
     data_loader = DataLoader(dataset, batch_size=1, shuffle=True)
 
     # Initialize model parallel
@@ -98,18 +109,7 @@ def main():
     m = Model(model=Transformer_modified(model_args), tokenizer=tokenizer)
     print(f'Model has {m.count_parameters():.1f}M trainable parameters.')
     # model = DDP(model, device_ids=[0], output_device=0)
-
-    # Perform training
-    with torch.set_grad_enabled(True):
-        for tensor_input, text in data_loader:
-            torch.cuda.empty_cache()
-            # targets = tensor_input = tensor_input.squeeze(0)
-            tensor_input, targets = m.mask_tokens(tensor_input.squeeze(0))
-            tensor_input = tensor_input.detach()
-            targets = targets.detach()
-            print(text)
-            m.train_model(tensor_input, targets)
-
+    m.train_model(data_loader)
     # clean up
     dist.destroy_process_group()
 
