@@ -19,14 +19,10 @@ class Model:
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.001)
 
     def custom_loss_function(self, outputs, labels):
-        softmax_outputs = F.softmax(outputs, dim=-1)
-
-        # Flatten both the softmax_outputs and labels
-        softmax_outputs_flat = softmax_outputs.view(-1, softmax_outputs.size(-1))
-        labels_flat = labels.view(-1)
-
-        # Compute the cross-entropy loss
-        loss = F.cross_entropy(softmax_outputs_flat, labels_flat, reduction='mean')
+        labels = labels.view(-1)
+        outputs = F.softmax(outputs, dim=-1)
+        outputs = outputs.view(-1, outputs.size(-1))
+        loss = F.cross_entropy(outputs, labels, reduction='mean')
         return loss
     
     def mask_tokens(self, input_tensor, mask_prob=0.15):
@@ -42,14 +38,15 @@ class Model:
             (torch.Tensor, torch.Tensor): Masked input tensor, labels tensor.
         """
         mask = torch.rand(input_tensor.shape) < mask_prob
-        masked_tensor = input_tensor.clone()
-        masked_tensor[mask] = self.tokenizer.mask_token_id
+
+        # Perform masking operation in-place
+        input_tensor[mask] = self.tokenizer.mask_token_id
 
         # Prepare labels tensor for computing loss
-        labels = torch.full_like(input_tensor, fill_value=-100)  # -100 is the default value for ignored index in cross-entropy loss
+        labels = torch.full_like(input_tensor, fill_value=-100)
         labels[mask] = input_tensor[mask]
 
-        return masked_tensor, labels
+        return input_tensor, labels
     
     def count_parameters(self):
         count = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -63,20 +60,20 @@ class Model:
             # print(f'Input : {text}')
             self.optimizer.zero_grad()
             # tensor_input, targets = self.mask_tokens(self.tokenizer("Hello how are you, I m doing great..", return_tensors="pt", max_length=32, truncation=True, padding='max_length')['input_ids'])
-            tensor_input, targets = self.mask_tokens(tensor_input.squeeze(0))
+            tensor_input, targets = self.mask_tokens(tensor_input.clone().squeeze(0))
             # # Forward pass
-            print(f'Input : {tensor_input} has grad : {tensor_input.requires_grad}')
+            # print(f'Input : {tensor_input} has grad : {tensor_input.requires_grad}')
             output = self.model(tokens = tensor_input, start_pos = 0)
-            print(f'Output : {output} has grad : {output.requires_grad}')
+            # print(f'Output : {output} has grad : {output.requires_grad}')
             # # Loss computation
             loss = self.custom_loss_function(output, targets)
             print(f'Loss : {loss.item()}')
-            print(f'Loss has grad : {loss.requires_grad}')
+            # print(f'Loss has grad : {loss.requires_grad}')
             # print(output._version)
             # ## Backpropagation
-            loss.backward()
-            # # Weight updates
-            self.optimizer.step()
+            loss.backward(retain_graph=True)
+            # Weight updates - with retain_graph=True, we can call backward multiple times, however, we need to call optimizer.step() only once
+        self.optimizer.step()
 
 class CustomDataset(Dataset):
     def __init__(self, data, tokenizer, max_length=512):
