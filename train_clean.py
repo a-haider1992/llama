@@ -59,18 +59,19 @@ class Model:
     def train_model(self, data_loader):
         # Perform model training here
         for index, (tensor_input, text) in enumerate(data_loader):
-            # print(f'Input : {text}')
             print(f'Index : {index+1}')
+            # print(f'Input : {text}')
             self.optimizer.zero_grad()
             # tensor_input, targets = self.mask_tokens(self.tokenizer("Hello how are you, I m doing great..", return_tensors="pt", max_length=32, truncation=True, padding='max_length')['input_ids'])
-            print(f'Input : {tensor_input}')
-            print(f'Index : {index+1}')
             tensor_input, targets = self.mask_tokens(tensor_input.squeeze(0))
             # # Forward pass
+            print(f'Input : {tensor_input} has grad : {tensor_input.requires_grad}')
             output = self.model(tokens = tensor_input, start_pos = 0)
+            print(f'Output : {output} has grad : {output.requires_grad}')
             # # Loss computation
             loss = self.custom_loss_function(output, targets)
             print(f'Loss : {loss.item()}')
+            print(f'Loss has grad : {loss.requires_grad}')
             # print(output._version)
             # ## Backpropagation
             loss.backward()
