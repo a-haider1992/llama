@@ -12,13 +12,22 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn.functional as F
 from data_prefetcher import DataPrefetcher
 import pdb
+import logging
 
 class Model:
-    def __init__(self, model, tokenizer, sequence_length=32):
+    def __init__(self, model, tokenizer, sequence_length=32, logging=None):
         self.model = model
         self.tokenizer = tokenizer
         self.context_length = sequence_length
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.001)
+        self.logging = logging
+
+    def load_model(self, path):
+        if os.path.isfile(path):
+            self.model.load_state_dict(torch.load(path))
+
+    def save_model(self, path):
+        torch.save(self.model.state_dict(), path)
 
     def custom_loss_function(self, outputs, labels):
         labels = labels.view(-1)
@@ -72,7 +81,7 @@ class Model:
             print(f'Instance {i + 1}, Loss: {loss.item()}')
         self.optimizer.step()
 
-    def train_model_V2(self, data_prefetcher, num_epochs=50, accumulation_steps=10, max_gradient_norm=None):
+    def train_model_V2(self, data_prefetcher, num_epochs=50, accumulation_steps=10, max_gradient_norm=None, mask_prob=0.15):
         self.model.train()
 
         for epoch in range(num_epochs):
@@ -82,7 +91,7 @@ class Model:
                 batch = data_prefetcher.next()
                 text = batch['text']
                 tensor_input = self.tokenizer(text, return_tensors="pt", max_length=self.context_length, truncation=True, padding='max_length')['input_ids']
-                tensor_input, targets = self.mask_tokens(tensor_input)
+                tensor_input, targets = self.mask_tokens(tensor_input, mask_prob=mask_prob)
 
                 output = self.model(tokens=tensor_input, start_pos=0)
                 loss = self.custom_loss_function(output, targets)
@@ -96,6 +105,7 @@ class Model:
 
             total_loss /= accumulation_steps  # Average loss over accumulation steps
             print(f'Epoch {epoch + 1}, Average Loss: {total_loss}')
+            self.logging.info(f'Epoch {epoch + 1}, Average Loss: {total_loss}')
 
         # Perform the final optimization step after the entire training loop
         self.optimizer.step()
@@ -104,28 +114,45 @@ class Model:
         
 def main():
     # Load datasets from the datasets library
-    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    device = torch.device('cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cpu')
     tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
     if tokenizer.mask_token is None:
         tokenizer.add_special_tokens({'mask_token': '[MASK]'}) # add new mask token to tokenizer
     data = load_dataset('bookcorpus', streaming=True)
-    sequence_length = 32
+    sequence_length = 64
 
     data_prefetcher = DataPrefetcher(loader=data['train'])
 
     # Initialize model parallel
     if not torch.distributed.is_initialized():
         torch.distributed.init_process_group(backend="nccl")
-    initialize_model_parallel(1)
+    initialize_model_parallel(2)
+    torch.cuda.set_device(dist.get_rank())
     torch.autograd.set_detect_anomaly(True)
-    model_args = ModelArgs(dim=32, vocab_size=tokenizer.vocab_size, n_layers=1, n_heads=1, max_seq_len=sequence_length,)
-    # pdb.set_trace()
-    m = Model(model=Transformer_modified(model_args), tokenizer=tokenizer)
-    print(f'Model has {m.count_parameters():.1f}M trainable parameters.')
+    model_args = ModelArgs(dim=1024, vocab_size=tokenizer.vocab_size, n_layers=1, n_heads=1, max_seq_len=sequence_length,)
+    pdb.set_trace()
+
+    # set up logging
+    log_file_name = 'training.log'
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', filename=log_file_name)
+
     # model = DDP(model, device_ids=[0], output_device=0)
-    m.train_model_V2(data_prefetcher, num_epochs=50)
-    torch.save(m.model.state_dict(), 'llama-scratch.pt')
+    for i in range(10):
+        logging.info(f'Model training iteration: {i + 1}')
+        print(f'Model training iteration: {i + 1}')
+        m = Model(model=Transformer_modified(model_args), tokenizer=tokenizer, logging=logging)
+        logging.info(f'Model has {m.count_parameters():.1f}M trainable parameters.')
+        # print(f'Model has {m.count_parameters():.1f}M trainable parameters.')
+        m.load_model(f'llama-scratch.pt')
+        m.train_model_V2(data_prefetcher, num_epochs=1000)
+        m.save_model(f'llama-scratch.pt')
+        print('Model saved!')
+        logging.info('Model saved!')
+        del m
+        print('----------------------')
+    # m.train_model_V2(data_prefetcher, num_epochs=10, mask_prob=0.20)
+    # torch.save(m.model.state_dict(), 'llama-scratch.pt')
     # clean up
     dist.destroy_process_group()
 
