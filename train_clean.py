@@ -4,7 +4,7 @@ from fairscale.nn.model_parallel.initialize import (
 )
 from llama.model_modified import Transformer_modified, ModelArgs
 from torch.utils.data import Dataset, DataLoader, IterableDataset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, LlamaTokenizer
 import os
 import torch
 import torch.distributed as dist
@@ -14,6 +14,7 @@ from data_prefetcher import DataPrefetcher
 import pdb
 import logging
 from typing import List, Literal, Optional, Tuple, TypedDict
+from tokenizers import Tokenizer
 
 
 class CompletionPrediction(TypedDict, total=False):
@@ -27,7 +28,8 @@ class Model:
         self.model = model
         self.tokenizer = tokenizer
         self.context_length = sequence_length
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.01)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.001)
+        # self.optimizer = torch.optim.Adamax(self.model.parameters(), lr=0.005)
         # self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.001)
         self.logging = logging
         self.device = device
@@ -91,7 +93,7 @@ class Model:
             print(f'Instance {i + 1}, Loss: {loss.item()}')
         self.optimizer.step()
 
-    def train_model_V2(self, data_prefetcher, num_epochs=50, accumulation_steps=10, max_gradient_norm=None, mask_prob=0.15):
+    def train_model_V2(self, data_prefetcher, num_epochs=50, accumulation_steps=1, max_gradient_norm=None, mask_prob=0.15):
         self.model.train()
 
         for epoch in range(num_epochs):
@@ -121,6 +123,31 @@ class Model:
         # Perform the final optimization step after the entire training loop
         self.optimizer.step()
         self.model.zero_grad()
+
+def sample_top_p(probs, p):
+    """
+    Perform top-p (nucleus) sampling on a probability distribution.
+
+    Args:
+        probs (torch.Tensor): Probability distribution tensor.
+        p (float): Probability threshold for top-p sampling.
+
+    Returns:
+        torch.Tensor: Sampled token indices.
+
+    Note:
+        Top-p sampling selects the smallest set of tokens whose cumulative probability mass
+        exceeds the threshold p. The distribution is renormalized based on the selected tokens.
+
+    """
+    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    mask = probs_sum - probs_sort > p
+    probs_sort[mask] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    next_token = torch.multinomial(probs_sort, num_samples=1)
+    next_token = torch.gather(probs_idx, -1, next_token)
+    return next_token
 
 # Model inference class
 class ModelInference:
@@ -171,16 +198,16 @@ class ModelInference:
         max_prompt_len = max(len(t) for t in prompt_tokens)
         assert max_prompt_len <= params.max_seq_len
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
-
-        pad_id = self.tokenizer.pad_id
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        pdb.set_trace()
+        pad_id = self.tokenizer.pad_token_id
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=self.device)
         for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device=self.device)
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
 
         prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device="cuda")
+        eos_reached = torch.tensor([False] * bsz, device=self.device)
         input_text_mask = tokens != pad_id
         if min_prompt_len == total_len:
             logits = self.model.forward(tokens, prev_pos)
@@ -213,7 +240,7 @@ class ModelInference:
                     ignore_index=pad_id,
                 )
             eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                next_token == self.tokenizer.eos_id
+                next_token == self.tokenizer.eos_token_id
             )
             prev_pos = cur_pos
             if all(eos_reached):
@@ -230,8 +257,8 @@ class ModelInference:
             if logprobs:
                 probs = token_logprobs[i][start : len(prompt_tokens[i]) + max_gen_len]
             # cut to eos tok if any
-            if self.tokenizer.eos_id in toks:
-                eos_idx = toks.index(self.tokenizer.eos_id)
+            if self.tokenizer.eos_token_id in toks:
+                eos_idx = toks.index(self.tokenizer.eos_token_id)
                 toks = toks[:eos_idx]
                 probs = probs[:eos_idx] if logprobs else None
             out_tokens.append(toks)
@@ -269,7 +296,7 @@ class ModelInference:
         """
         if max_gen_len is None:
             max_gen_len = self.model.params.max_seq_len - 1
-        prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+        prompt_tokens = [self.tokenizer.encode(x) for x in prompts]
         generation_tokens, generation_logprobs = self.generate(
             prompt_tokens=prompt_tokens,
             max_gen_len=max_gen_len,
@@ -287,16 +314,25 @@ class ModelInference:
                 }
                 for t, logprobs_i in zip(generation_tokens, generation_logprobs)
             ]
+        pdb.set_trace()
         return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
 
         
 def main():
     # Load datasets from the datasets library
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # device = torch.device('cpu')
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu')
     tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+    # tokenizer = LlamaTokenizer.from_pretrained('tokenizer.model')
     if tokenizer.mask_token is None:
         tokenizer.add_special_tokens({'mask_token': '[MASK]'}) # add new mask token to tokenizer
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': '[PAD]'}) # add new pad token to tokenizer
+    if tokenizer.eos_token is None:
+        tokenizer.add_special_tokens({'eos_token': '[EOS]'}) # add new pad token to tokenizer
+    
+    pdb.set_trace()
+    
     data = load_dataset('bookcorpus', streaming=True)
     sequence_length = 32
 
@@ -309,31 +345,35 @@ def main():
     model_args = ModelArgs(dim=32, vocab_size=tokenizer.vocab_size, n_layers=1, n_heads=1, max_seq_len=sequence_length,)
     pdb.set_trace()
 
-    # set up logging
-    log_file_name = 'training.log'
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', filename=log_file_name)
+    train = True
 
-    # model = DDP(model, device_ids=[0], output_device=0)
-    for i in range(100):
-        logging.info('----------------------')
-        logging.info(f'Model training iteration: {i + 1}')
-        print(f'Model training iteration: {i + 1}')
-        data_prefetcher = DataPrefetcher(loader=data['train'])
-        m = Model(model=Transformer_modified(model_args), tokenizer=tokenizer, logging=logging, device=device)
-        logging.info(f'Model has {m.count_parameters():.1f}M trainable parameters.')
-        # print(f'Model has {m.count_parameters():.1f}M trainable parameters.')
-        m.load_model(f'llama-scratch.pt')
-        m.train_model_V2(data_prefetcher, num_epochs=10, max_gradient_norm=1.0, mask_prob=0.15)
-        m.save_model(f'llama-scratch.pt')
-        print('Model saved!')
-        logging.info('Model saved!')
-        del m
-        del data_prefetcher
-        logging.info('----------------------')
+    # set up logging
+    if train:
+        log_file_name = 'training.log'
+        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', filename=log_file_name)
+
+        # model = DDP(model, device_ids=[0], output_device=0)
+        for i in range(1000):
+            logging.info('----------------------')
+            logging.info(f'Model training iteration: {i + 1}')
+            print(f'Model training iteration: {i + 1}')
+            data_prefetcher = DataPrefetcher(loader=data['train'])
+            m = Model(model=Transformer_modified(model_args), tokenizer=tokenizer, logging=logging, device=device)
+            logging.info(f'Model has {m.count_parameters():.1f}M trainable parameters.')
+            # print(f'Model has {m.count_parameters():.1f}M trainable parameters.')
+            m.load_model(f'llama-scratch.pt')
+            m.train_model_V2(data_prefetcher, num_epochs=1000, max_gradient_norm=10.0, mask_prob=0.30)
+            m.save_model(f'llama-scratch.pt')
+            print('Model saved!')
+            logging.info('Model saved!')
+            del m
+            del data_prefetcher
+            logging.info('----------------------')
     # Model Inferece
-    # model = ModelInference(model=Transformer_modified(model_args), tokenizer=tokenizer, device=device)
-    # model.load_model(f'llama-scratch.pt')
-    # print(model.text_completion(['The cat sat on the mat.']))
+    else:
+        model = ModelInference(model=Transformer_modified(model_args), tokenizer=tokenizer, device=device)
+        model.load_model(f'llama-scratch.pt')
+        print(model.text_completion(['Hello how..']))
     # clean up
     dist.destroy_process_group()
 
